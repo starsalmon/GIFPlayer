@@ -4,6 +4,17 @@ Desk-toy firmware that plays random GIF animations on a **170x320 ST7789 TFT** u
 
 It prefers GIFs from an **SD card** (FAT) when inserted, and falls back to **SPIFFS** if no SD GIFs are found.
 
+## Demo
+
+<p float="left">
+  <img src="demo/facep.gif" width="320" />
+  <img src="demo/frymoney.gif" width="320" />
+</p>
+<p float="left">
+  <img src="demo/whytheface.gif" width="320" />
+  <img src="demo/winception.gif" width="320" />
+</p>
+
 ## Hardware
 
 ### Display (ST7789, SPI)

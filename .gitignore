@@ -1,6 +1,8 @@
 .DS_Store
 gifs/.DS_Store
 gifs/._*
+demo/.DS_Store
+demo/._*
 .cache/
 compile_commands.json
 
