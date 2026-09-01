@@ -1,0 +1,6 @@
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=/Users/cain.davidson/Documents/cursor-esp32/GIFPlayer/.cache/clangd",
+        "--query-driver=/Users/cain.davidson/.platformio/packages/toolchain-*/bin/*,/Users/cain.davidson/.platformio/packages/tool-*/bin/*"
+    ]
+}
