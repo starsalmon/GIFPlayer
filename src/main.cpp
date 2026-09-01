@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <vector>
 
+#ifndef MAX_WIDTH
+#define MAX_WIDTH 1024
+#endif
 #include <AnimatedGIF.h>
 
 #include <dirent.h>
@@ -15,11 +18,16 @@
 #include "sdmmc_cmd.h"
 
 #include "lgfx_pros3_st7789_170x320.hpp"
+#include "gfp_boot.h"
+
+#define LDO2_EN   17
 
 #ifndef SD_CS
-  // NOTE: Avoid ESP32-S3 strapping pins for SD CS (GPIO3 is a strapping pin).
-  // Pick a "boring" GPIO with no boot function.
   #define SD_CS 15
+#endif
+
+#ifndef SD_SPI_FREQ_KHZ
+  #define SD_SPI_FREQ_KHZ 40000
 #endif
 
 #ifndef GIFPLAYER_DEBUG
@@ -64,6 +72,8 @@ static bool readFileToRam(const String& path, uint8_t** outBuf, size_t* outSize)
   const size_t kMaxBytes = 2 * 1024 * 1024;
 
   if (path.startsWith("/sd/")) {
+    tft.endWrite();
+    GIFLOG("[GIF] read sd: %s\n", path.c_str());
     FILE* fp = fopen(path.c_str(), "rb");
     if (!fp) return false;
     fseek(fp, 0, SEEK_END);
@@ -184,7 +194,16 @@ static void scanForGifsRecursiveSd(const String& dir) {
   closedir(d);
 }
 
-static bool mountSdCardIfPresent() {
+static void scanSdGifs() {
+  scanForGifsRecursiveSd(String(kSdMountPath));
+  const String gifsDir = String(kSdMountPath) + "/gifs";
+  struct stat st;
+  if (stat(gifsDir.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+    scanForGifsRecursiveSd(gifsDir);
+  }
+}
+
+static bool mountSdCardIfPresent(int maxFreqKhz) {
   if (s_sdMounted) return true;
 
   esp_vfs_fat_mount_config_t mount_config = VFS_FAT_MOUNT_DEFAULT_CONFIG();
@@ -192,27 +211,65 @@ static bool mountSdCardIfPresent() {
   mount_config.allocation_unit_size = 16 * 1024;
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-  // Use the same ESP-IDF SPI host as the TFT (LovyanGFX uses spi_master too).
   host.slot = TFT_SPI_HOST;
-  // SD over SPI default is 20MHz. Reading the GIF into RAM first means the SD
-  // bus isn't used while we're blasting pixels to the TFT.
-  host.max_freq_khz = 20000; // 20 MHz
+  host.max_freq_khz = maxFreqKhz;
 
   sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
   slot_config.gpio_cs = (gpio_num_t)SD_CS;
   slot_config.host_id = (spi_host_device_t)TFT_SPI_HOST;
 
+  GIFLOG("[SD] init cs=%d host=%d freq=%d kHz\n",
+         (int)SD_CS, (int)TFT_SPI_HOST, maxFreqKhz);
+
   const esp_err_t err = esp_vfs_fat_sdspi_mount(
       kSdMountPath, &host, &slot_config, &mount_config, &s_sdCard);
   if (err != ESP_OK) {
-    GIFERR("[SD] mount failed (cs=%d host=%d): %s (%d)\n",
-           (int)SD_CS, (int)TFT_SPI_HOST, esp_err_to_name(err), (int)err);
+    GIFERR("[SD] mount failed (cs=%d host=%d freq=%d kHz): %s (0x%x)\n",
+           (int)SD_CS, (int)TFT_SPI_HOST, maxFreqKhz, esp_err_to_name(err), (unsigned)err);
     return false;
   }
 
   s_sdMounted = true;
   GIFLOG("[SD] mounted at %s\n", kSdMountPath);
   return true;
+}
+
+static bool mountSdWithRetry() {
+  static constexpr int kFreqsKhz[] = { SD_SPI_FREQ_KHZ, 20000, 4000 };
+  for (size_t i = 0; i < sizeof(kFreqsKhz) / sizeof(kFreqsKhz[0]); ++i) {
+    if (mountSdCardIfPresent(kFreqsKhz[i])) return true;
+  }
+  return false;
+}
+
+struct BootSummary {
+  bool sdOk = false;
+  bool spiffsOk = false;
+  bool sdScanned = false;
+  bool spiffsScanned = false;
+  size_t gifCount = 0;
+  const char* gifSource = "none";
+};
+
+static void redrawBootSummary(const BootSummary& s) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.println("GIFPlayer");
+  tft.printf("Screen: %dx%d\n", (int)tft.width(), (int)tft.height());
+  tft.printf("SD SPI: %u MHz\n", (unsigned)(SD_SPI_FREQ_KHZ / 1000));
+  tft.println();
+
+  tft.printf("SD mount ..... %s\n", s.sdOk ? "ok" : "fail");
+  tft.printf("SPIFFS ..... %s\n", s.spiffsOk ? "ok" : "fail");
+  tft.printf("SD scan ..... %s\n", s.sdScanned ? "done" : "skip");
+  tft.printf("SPIFFS scan ..... %s\n", s.spiffsScanned ? "done" : "skip");
+  if (s.gifCount > 0) {
+    tft.printf("GIFs: %u (%s)\n", (unsigned)s.gifCount, s.gifSource);
+  } else {
+    tft.println("GIFs: 0");
+  }
 }
 
 // --- AnimatedGIF draw callback (RGB565) ---
@@ -375,13 +432,15 @@ static void playGif(const String& path) {
 
 void setup() {
   Serial.begin(115200);
+
+  pinMode(LDO2_EN, OUTPUT);
+  digitalWrite(LDO2_EN, HIGH);
+
   delay(200);
 
-  // Force backlight on (many modules just need BL=HIGH).
   pinMode(14, OUTPUT);
   digitalWrite(14, HIGH);
 
-  // Hard reset pulse (some ST7789 breakouts need a real reset edge).
   pinMode(2, OUTPUT);
   digitalWrite(2, HIGH);
   delay(10);
@@ -391,51 +450,82 @@ void setup() {
   delay(120);
 
   tft.init();
-  tft.setRotation(1); // rotate 90° (landscape)
+  tft.setRotation(1);
   GIFLOG("[TFT] init ok w=%d h=%d\n", tft.width(), tft.height());
   tft.fillScreen(TFT_BLACK);
-
   tft.setTextSize(1);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(0, 0);
+
+  auto& boot = gfpBoot();
+  boot.attach(&tft);
+
   tft.println("GIFPlayer");
+  tft.printf("Screen: %dx%d\n", (int)tft.width(), (int)tft.height());
+  tft.printf("SD SPI: %u MHz\n", (unsigned)(SD_SPI_FREQ_KHZ / 1000));
+  tft.println();
 
-  if (!SPIFFS.begin(true)) {
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.println("SPIFFS mount failed");
-    for (;;) delay(1000);
-  }
-  tft.println("SPIFFS ok");
+  BootSummary summary;
 
-  // Prefer SD card GIFs if present (mounts at /sd).
+  // SD mount first. No TFT updates during mount (shared SPI bus).
+  boot.begin("SD mount");
+  summary.sdOk = mountSdWithRetry();
+  boot.end(summary.sdOk ? " ok" : " fail", 0);
+
+  boot.begin("SPIFFS");
+  summary.spiffsOk = SPIFFS.begin(true);
+  boot.end(summary.spiffsOk ? " ok" : " fail", 0);
+
   s_gifPaths.clear();
-  if (mountSdCardIfPresent()) {
-    scanForGifsRecursiveSd(String(kSdMountPath));
-    scanForGifsRecursiveSd(String(kSdMountPath) + "/gifs");
+  if (summary.sdOk) {
+    boot.begin("SD scan");
+    scanSdGifs();
+    summary.sdScanned = true;
+    boot.end(" done", 0);
+  } else {
+    boot.begin("SD scan");
+    boot.end(" skip", 0);
   }
 
-  // Fall back to SPIFFS GIFs.
-  if (s_gifPaths.empty()) {
-    // With `data_dir = gifs`, the files land at SPIFFS root.
+  if (s_gifPaths.empty() && summary.spiffsOk) {
+    boot.begin("SPIFFS scan");
     scanForGifsRecursiveSpiffs("/");
     scanForGifsRecursiveSpiffs("/gifs");
+    summary.spiffsScanned = true;
+    boot.end(" done", 0);
+  } else if (!summary.spiffsOk) {
+    boot.begin("SPIFFS scan");
+    boot.end(" skip", 0);
+  } else {
+    boot.begin("SPIFFS scan");
+    boot.end(" skip", 0);
   }
 
   std::sort(s_gifPaths.begin(), s_gifPaths.end(),
             [](const String& a, const String& b) { return a < b; });
 
+  summary.gifCount = s_gifPaths.size();
+  if (summary.gifCount > 0) {
+    summary.gifSource = s_gifPaths[0].startsWith("/sd/") ? "SD" : "SPIFFS";
+  }
+
   GIFLOG("[GIF] found %u files\n", (unsigned)s_gifPaths.size());
   for (size_t i = 0; i < s_gifPaths.size(); i++) {
     GIFLOG("[GIF] #%u %s\n", (unsigned)(i + 1), s_gifPaths[i].c_str());
   }
+
   if (s_gifPaths.empty()) {
+    redrawBootSummary(summary);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.println("No .gif files");
-    tft.println("Upload FS");
+    tft.println("No GIFs found");
+    boot.hold(4000);
     for (;;) delay(1000);
   }
 
-  // The library can emit RGB565 palettes already byte-swapped for display writes.
+  // Redraw so every final status is visible together (SD mount included).
+  redrawBootSummary(summary);
+  boot.hold(4000);
+
   gif.begin(BIG_ENDIAN_PIXELS);
   randomSeed((uint32_t)esp_random());
 }
